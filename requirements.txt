@@ -1,0 +1,18 @@
+# Runtime deps for the extraction pipeline (CI = GitHub Actions).
+# torch + torchvision are installed separately from the CPU wheel index in the
+# workflow, so they are intentionally NOT listed here.
+docling==2.110.0
+numpy==2.4.6
+pillow==12.3.0
+scipy==1.17.1
+scikit-image==0.26.0
+spandrel==0.4.2
+rapidocr==3.9.1
+onnxruntime==1.27.0
+opencv-python==5.0.0.93
+huggingface_hub==1.22.0
+safetensors==0.8.0
+google-api-python-client==2.198.0
+google-auth==2.55.2
+google-auth-httplib2==0.4.0
+google-auth-oauthlib==1.4.0

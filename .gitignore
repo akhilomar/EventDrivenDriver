@@ -1,0 +1,18 @@
+# secrets — NEVER commit these
+credentials.json
+token_flow.json
+
+# local env / caches
+venv/
+__pycache__/
+*.pyc
+_drive_scratch/
+output/
+
+# large unused model (pipeline uses the 18MB anime model, committed below)
+models/RealESRGAN_x4plus.pth
+
+# local test images (not needed in CI)
+*.jpeg
+*.jpg
+Human Respiratory system.png
