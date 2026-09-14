@@ -11,10 +11,14 @@ Env:
   NOTIFY_TO           recipient(s), comma-separated (default: GMAIL_USER)
   NOTIFY_ON           "always" (default) or "problems" -- only mail when
                       something was skipped/failed, or the job itself crashed
+  EXPECTED_JSON       JSON list of {id,name} the run set out to process, so an
+                      image whose job died before writing a result is reported
+                      as missing instead of silently vanishing
   RUN_URL, JOB_STATUS optional context from the workflow
 
 Usage: python notify_email.py summary.txt
 """
+import json
 import os
 import smtplib
 import sys
@@ -36,12 +40,34 @@ def read_summary(path: Path):
     return rows
 
 
+def add_missing(rows, expected_json: str):
+    """Images the run meant to handle but got no result line for -- their job
+    died before the summary was written (install failure, runner eviction)."""
+    try:
+        expected = json.loads(expected_json or "[]")
+    except ValueError:
+        return rows
+    have = {r[1] for r in rows}
+    for f in expected:
+        name = f.get("name", "") if isinstance(f, dict) else str(f)
+        if name and name not in have:
+            rows.append(["NO RESULT", name, "0",
+                         "job ended before reporting -- still in Incoming"])
+    return rows
+
+
 def build(rows, job_status: str, run_url: str):
     ok = [r for r in rows if r[0] == "OK"]
     bad = [r for r in rows if r[0] != "OK"]
-    crashed = job_status not in ("success", "")
+    # "skipped" = the extract job had nothing to do, which is not a failure.
+    crashed = job_status not in ("success", "skipped", "")
 
-    if crashed and not rows:
+    if len(rows) == 1:
+        # The normal case: one dispatch, one image, one mail -- name it in the
+        # subject so the inbox reads as a per-image log.
+        st, name = rows[0][0], rows[0][1]
+        subject = f"{name} {'processed' if st == 'OK' else 'failed'}"
+    elif crashed and not rows:
         subject = "Drive extract: run FAILED before any image was processed"
     elif bad:
         subject = f"Drive extract: {len(ok)} done, {len(bad)} need attention"
@@ -80,12 +106,14 @@ def main():
         return
     to = [a.strip() for a in
           (os.environ.get("NOTIFY_TO") or user).split(",") if a.strip()]
-    rows = read_summary(summary)
+    rows = add_missing(read_summary(summary),
+                       os.environ.get("EXPECTED_JSON", ""))
     job_status = os.environ.get("JOB_STATUS", "")
     subject, body = build(rows, job_status, os.environ.get("RUN_URL", ""))
 
     if os.environ.get("NOTIFY_ON", "always") == "problems":
-        if job_status in ("success", "") and all(r[0] == "OK" for r in rows):
+        if (job_status in ("success", "skipped", "")
+                and all(r[0] == "OK" for r in rows)):
             print("[MAIL] nothing wrong and NOTIFY_ON=problems; skipping email.")
             return
 
