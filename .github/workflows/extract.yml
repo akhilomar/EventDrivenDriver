@@ -31,17 +31,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
-      - name: Install PyTorch (CPU only)
+      # Every dependency is version-pinned, so the whole installed environment is
+      # reusable: cache the venv itself instead of re-downloading ~200MB of torch
+      # wheels on every upload. The key changes only when requirements.txt or the
+      # torch pin changes -- i.e. only when a reinstall is actually needed.
+      - name: Cache Python environment
+        id: venv-cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py311-torch2.12.1-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies (only on a cache miss)
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu \
             torch==2.12.1 torchvision==0.27.1
+          .venv/bin/pip install -r requirements.txt
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+      # Rolling key: this run always saves whatever models it downloaded and
+      # restores the newest earlier entry, so one incomplete first cache can't
+      # pin every later run to a missing model.
       - name: Cache model downloads (docling / huggingface / rapidocr)
         uses: actions/cache@v4
         with:
@@ -49,7 +62,8 @@ jobs:
             ~/.cache/huggingface
             ~/.cache/docling
             ~/.cache/rapidocr
-          key: model-cache-${{ runner.os }}-v1
+          key: model-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: model-cache-${{ runner.os }}-
 
       - name: Run extraction
         env:
@@ -59,7 +73,7 @@ jobs:
           # file id from the event payload, or the manual input, or "" (scan all)
           FILE_ID: ${{ github.event.client_payload.file_id || github.event.inputs.file_id }}
         run: |
-          python drive_flow.py \
+          .venv/bin/python drive_flow.py \
             --input "$INPUT_FOLDER" \
             --archive "$ARCHIVE_FOLDER" \
             --output "$OUTPUT_FOLDER" \
