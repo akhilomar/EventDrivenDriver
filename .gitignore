@@ -16,3 +16,8 @@ models/RealESRGAN_x4plus.pth
 *.jpeg
 *.jpg
 Human Respiratory system.png
+
+# local test images / scratch outputs (not needed in CI)
+1.png
+Vertical Ferrous Sulphate Heating Experiment.png
+processed_image/

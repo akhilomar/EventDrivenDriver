@@ -18,14 +18,20 @@ Requires 'credentials.json' (OAuth desktop client, Drive API enabled). First run
 opens a browser for consent and saves 'token_flow.json'. Needs full Drive scope.
 """
 import argparse
+import http.client
 import io
 import os
+import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 PIPELINE = str(Path(__file__).resolve().parent / "pipeline.py")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from names import safe_name
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -37,6 +43,44 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 TOKEN = "token_flow.json"
 SCRATCH = Path("_drive_scratch")
 IMAGE_MIMES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
+
+
+def _drop_connections(h):
+    """Discard httplib2's pooled sockets so the next call dials fresh.
+    `h` may be an AuthorizedHttp wrapper or a raw httplib2.Http."""
+    for obj in (h, getattr(h, "http", None)):
+        conns = getattr(obj, "connections", None)
+        if isinstance(conns, dict):
+            for c in list(conns.values()):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            conns.clear()
+
+
+def execute(req, tries=6):
+    """Run a Drive API request with retries that survive dead sockets.
+
+    Extraction takes minutes per image, so the pooled HTTPS connection is often
+    stale by the time we upload -> ssl.SSLEOFError / BrokenPipe on the first
+    call. googleapiclient's own num_retries covers transient 5xx/rate limits;
+    the outer loop additionally drops httplib2's cached connections so the next
+    attempt dials a fresh socket.
+    """
+    import random
+    for attempt in range(tries):
+        try:
+            return req.execute(num_retries=4)
+        except (ssl.SSLError, socket.error, http.client.HTTPException,
+                OSError) as e:
+            if attempt == tries - 1:
+                raise
+            _drop_connections(req.http)
+            wait = min(2 ** attempt, 30) + random.random()
+            print(f"[RETRY] {type(e).__name__}: {e} -- retrying in {wait:.1f}s "
+                  f"({attempt + 1}/{tries - 1})")
+            time.sleep(wait)
 
 
 def service():
@@ -77,17 +121,17 @@ def resolve_folder(svc, name_or_id, create=True):
     """Accept a folder id or name. If a name and it doesn't exist, optionally create."""
     # treat as id if it looks like one and resolves
     try:
-        meta = svc.files().get(fileId=name_or_id, fields="id,mimeType").execute()
+        meta = execute(svc.files().get(fileId=name_or_id, fields="id,mimeType"))
         if meta["mimeType"] == "application/vnd.google-apps.folder":
             return meta["id"]
     except Exception:
         pass
     q = ("mimeType='application/vnd.google-apps.folder' and trashed=false and "
          f"name='{name_or_id}'")
-    hits = svc.files().list(
+    hits = execute(svc.files().list(
         q=q, pageSize=50,
         fields="files(id,name,ownedByMe,capabilities(canAddChildren))"
-    ).execute().get("files", [])
+    )).get("files", [])
 
     if create:
         # need a WRITABLE folder — prefer one you own; ignore read-only shares.
@@ -97,9 +141,9 @@ def resolve_folder(svc, name_or_id, create=True):
         if pick:
             return pick[0]["id"]
         # no writable match (e.g. only a view-only shared folder) -> make our own
-        folder = svc.files().create(
+        folder = execute(svc.files().create(
             body={"name": name_or_id, "mimeType": "application/vnd.google-apps.folder"},
-            fields="id").execute()
+            fields="id"))
         print(f"[DRIVE] created writable folder '{name_or_id}' ({folder['id']})")
         return folder["id"]
 
@@ -116,8 +160,8 @@ def list_images(svc, folder_id):
     out = []
     tok = None
     while True:
-        resp = svc.files().list(q=q, fields="nextPageToken, files(id,name,mimeType)",
-                                pageToken=tok).execute()
+        resp = execute(svc.files().list(
+            q=q, fields="nextPageToken, files(id,name,mimeType)", pageToken=tok))
         out.extend(resp.get("files", []))
         tok = resp.get("nextPageToken")
         if not tok:
@@ -125,42 +169,70 @@ def list_images(svc, folder_id):
     return out
 
 
-def download(svc, file_id, dest: Path):
+def download(svc, file_id, dest: Path, tries=4):
     dest.parent.mkdir(parents=True, exist_ok=True)
-    req = svc.files().get_media(fileId=file_id)
-    buf = io.FileIO(str(dest), "wb")
-    dl = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    buf.close()
+    for attempt in range(tries):
+        req = svc.files().get_media(fileId=file_id)
+        buf = io.FileIO(str(dest), "wb")
+        try:
+            dl = MediaIoBaseDownload(buf, req)
+            done = False
+            while not done:
+                _, done = dl.next_chunk(num_retries=4)
+            return
+        except (ssl.SSLError, socket.error, http.client.HTTPException, OSError) as e:
+            if attempt == tries - 1:
+                raise
+            _drop_connections(req.http)
+            print(f"[RETRY] download {type(e).__name__}: {e}")
+            time.sleep(2 ** attempt)
+        finally:
+            buf.close()
+
+
+def upload_file(svc, f: Path, parent_id: str, tries=5):
+    """Upload one file, rebuilding the media object per attempt (a consumed
+    MediaFileUpload cannot be replayed after a mid-stream socket death)."""
+    for attempt in range(tries):
+        try:
+            media = MediaFileUpload(str(f), resumable=True, chunksize=8 * 1024 * 1024)
+            req = svc.files().create(body={"name": f.name, "parents": [parent_id]},
+                                     media_body=media, fields="id")
+            resp = None
+            while resp is None:
+                _, resp = req.next_chunk(num_retries=4)
+            return resp
+        except (ssl.SSLError, socket.error, http.client.HTTPException, OSError) as e:
+            if attempt == tries - 1:
+                raise
+            _drop_connections(svc._http)
+            print(f"[RETRY] upload {f.name}: {type(e).__name__}: {e}")
+            time.sleep(2 ** attempt)
 
 
 def upload_folder(svc, local: Path, parent_id: str):
-    top = svc.files().create(
+    top = execute(svc.files().create(
         body={"name": local.name, "parents": [parent_id],
               "mimeType": "application/vnd.google-apps.folder"},
-        fields="id, webViewLink").execute()
+        fields="id, webViewLink"))
     for f in sorted(local.glob("*")):
         if f.is_file():
-            svc.files().create(body={"name": f.name, "parents": [top["id"]]},
-                               media_body=MediaFileUpload(str(f))).execute()
+            upload_file(svc, f, top["id"])
     for subname in ("icons", "icons_4k", "numbered"):
         sub = local / subname
         if sub.is_dir() and any(sub.glob("*.png")):
-            sid = svc.files().create(
+            sid = execute(svc.files().create(
                 body={"name": subname, "parents": [top["id"]],
                       "mimeType": "application/vnd.google-apps.folder"},
-                fields="id").execute()["id"]
+                fields="id"))["id"]
             for f in sorted(sub.glob("*.png")):
-                svc.files().create(body={"name": f.name, "parents": [sid]},
-                                   media_body=MediaFileUpload(str(f))).execute()
+                upload_file(svc, f, sid)
     return top.get("webViewLink")
 
 
 def move_file(svc, file_id, new_parent, old_parent):
-    svc.files().update(fileId=file_id, addParents=new_parent,
-                       removeParents=old_parent, fields="id").execute()
+    execute(svc.files().update(fileId=file_id, addParents=new_parent,
+                               removeParents=old_parent, fields="id"))
 
 
 def process_with_timeout(img_path, outbase, res4k, timeout):
@@ -180,47 +252,80 @@ def process_with_timeout(img_path, outbase, res4k, timeout):
         return None, f"timed out after {timeout}s"
     except subprocess.CalledProcessError as e:
         return None, f"pipeline failed (exit {e.returncode})"
-    out = Path(outbase) / Path(img_path).stem
+    # same sanitiser the pipeline used to name the folder: a Drive filename can
+    # end in a space, which Windows drops when it creates the directory.
+    out = Path(outbase) / safe_name(img_path)
     return (out, None) if out.exists() else (None, "no output produced")
 
 
-def process_one(svc, img, input_id, archive_id, output_id, res4k, timeout):
-    """Download, extract, upload, archive a single Drive image dict."""
+def process_one(svc, img, input_id, archive_id, output_id, res4k, timeout,
+                keep_scratch=False):
+    """Download, extract, upload, archive a single Drive image dict.
+
+    Never raises: a failure on one image is reported and the image is left in
+    the input folder so the next run retries it, instead of aborting the batch.
+    """
     print(f"\n=== {img['name']} ===")
     t0 = time.time()
     local_img = SCRATCH / img["name"]
-    download(svc, img["id"], local_img)
-    out_folder, err = process_with_timeout(local_img, SCRATCH / "out", res4k, timeout)
-    if err:
-        print(f"[SKIP] {img['name']}: {err}. Left in input folder for retry. "
-              f"Elapsed {time.time() - t0:.1f}s")
+    out_folder = None
+    try:
+        download(svc, img["id"], local_img)
+        out_folder, err = process_with_timeout(local_img, SCRATCH / "out", res4k, timeout)
+        if err:
+            print(f"[SKIP] {img['name']}: {err}. Left in input folder for retry. "
+                  f"Elapsed {time.time() - t0:.1f}s")
+            return False
+        link = upload_folder(svc, out_folder, output_id)
+        move_file(svc, img["id"], archive_id, input_id)
+        print(f"[DONE] {img['name']} in {time.time() - t0:.1f}s "
+              f"-> {link}; original archived.")
+        return True
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        print(f"[FAIL] {img['name']}: {type(e).__name__}: {e}. Left in input "
+              f"folder for retry. Elapsed {time.time() - t0:.1f}s")
         return False
-    link = upload_folder(svc, out_folder, output_id)
-    move_file(svc, img["id"], archive_id, input_id)
-    print(f"[DONE] {img['name']} in {time.time() - t0:.1f}s "
-          f"-> {link}; original archived.")
-    return True
+    finally:
+        if not keep_scratch:
+            # a long batch otherwise fills the disk with 4K PNGs
+            try:
+                local_img.unlink(missing_ok=True)
+                if out_folder and Path(out_folder).exists():
+                    shutil.rmtree(out_folder, ignore_errors=True)
+            except Exception:
+                pass
 
 
-def run_once(svc, input_id, archive_id, output_id, res4k, timeout):
+def run_once(svc, input_id, archive_id, output_id, res4k, timeout,
+             keep_scratch=False):
     images = list_images(svc, input_id)
     if not images:
         print("[DRIVE] no images in input folder.")
         return 0
-    for img in images:
-        process_one(svc, img, input_id, archive_id, output_id, res4k, timeout)
+    print(f"[DRIVE] {len(images)} image(s) to process.")
+    ok = 0
+    for i, img in enumerate(images, 1):
+        print(f"\n--- [{i}/{len(images)}] ---")
+        ok += bool(process_one(svc, img, input_id, archive_id, output_id,
+                               res4k, timeout, keep_scratch))
+    failed = len(images) - ok
+    print(f"\n[DRIVE] batch done: {ok} ok, {failed} left in input folder"
+          + (" — re-run to retry them." if failed else "."))
     return len(images)
 
 
-def watch_events(svc, input_id, archive_id, output_id, res4k, timeout, interval):
+def watch_events(svc, input_id, archive_id, output_id, res4k, timeout, interval,
+                 keep_scratch=False):
     """Event-style watcher using Drive's Changes feed: reacts within `interval`
     seconds of an upload to the input folder, fetching only deltas (cheap) rather
     than re-listing the whole folder each poll."""
     # process anything already sitting in the folder first
     print("[WATCH] clearing any existing images in input folder...")
-    run_once(svc, input_id, archive_id, output_id, res4k, timeout)
+    run_once(svc, input_id, archive_id, output_id, res4k, timeout, keep_scratch)
 
-    page_token = svc.changes().getStartPageToken().execute()["startPageToken"]
+    page_token = execute(svc.changes().getStartPageToken())["startPageToken"]
     print(f"[WATCH] event mode: polling changes every {interval}s "
           f"({timeout}s/image timeout). Drop images in the input folder — "
           "they process automatically. Ctrl+C to stop.")
@@ -228,11 +333,11 @@ def watch_events(svc, input_id, archive_id, output_id, res4k, timeout, interval)
         try:
             token = page_token
             while token:
-                resp = svc.changes().list(
+                resp = execute(svc.changes().list(
                     pageToken=token, spaces="drive", pageSize=100,
                     fields=("newStartPageToken, nextPageToken, "
                             "changes(removed, file(id,name,mimeType,parents,trashed))")
-                ).execute()
+                ))
                 for ch in resp.get("changes", []):
                     if ch.get("removed"):
                         continue
@@ -240,7 +345,8 @@ def watch_events(svc, input_id, archive_id, output_id, res4k, timeout, interval)
                     if (not f.get("trashed") and f.get("mimeType") in IMAGE_MIMES
                             and input_id in (f.get("parents") or [])):
                         process_one(svc, {"id": f["id"], "name": f["name"]},
-                                    input_id, archive_id, output_id, res4k, timeout)
+                                    input_id, archive_id, output_id, res4k,
+                                    timeout, keep_scratch)
                 if "nextPageToken" in resp:
                     token = resp["nextPageToken"]
                 else:
@@ -266,6 +372,9 @@ def main():
                     help="event mode: auto-process new uploads to the input folder")
     ap.add_argument("--interval", type=int, default=15,
                     help="seconds between change checks when --watch (default 15)")
+    ap.add_argument("--keep-scratch", action="store_true",
+                    help="keep downloaded images and local results in _drive_scratch "
+                         "(default: delete after a successful upload)")
     ap.add_argument("--file-id", default="",
                     help="process only this Drive file id, then exit (event/CI mode)")
     args = ap.parse_args()
@@ -278,20 +387,22 @@ def main():
     # Event/CI mode: a single file id was pushed (e.g. from Apps Script). Process
     # just that one file and exit — this is what a GitHub Actions run does.
     if args.file_id:
-        meta = svc.files().get(
-            fileId=args.file_id, fields="id,name,mimeType").execute()
+        meta = execute(svc.files().get(
+            fileId=args.file_id, fields="id,name,mimeType"))
         if meta.get("mimeType") not in IMAGE_MIMES:
             print(f"[SKIP] {meta.get('name')}: not an image ({meta.get('mimeType')}).")
             return
         process_one(svc, {"id": meta["id"], "name": meta["name"]},
-                    input_id, archive_id, output_id, args.res4k, args.timeout)
+                    input_id, archive_id, output_id, args.res4k, args.timeout,
+                    args.keep_scratch)
         return
 
     if args.watch:
         watch_events(svc, input_id, archive_id, output_id,
-                     args.res4k, args.timeout, args.interval)
+                     args.res4k, args.timeout, args.interval, args.keep_scratch)
     else:
-        run_once(svc, input_id, archive_id, output_id, args.res4k, args.timeout)
+        run_once(svc, input_id, archive_id, output_id, args.res4k, args.timeout,
+                 args.keep_scratch)
 
 
 if __name__ == "__main__":

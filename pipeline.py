@@ -28,6 +28,7 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, ImageFormatOption
 from docling_core.types.doc import PictureItem
+from names import safe_name
 
 # anime_6B: 6 RRDB blocks vs 23 in x4plus -> ~3-4x faster on CPU, and better on
 # flat cartoon/illustration art (which these icons are). Used for the extraction
@@ -35,6 +36,23 @@ from docling_core.types.doc import PictureItem
 MODEL_FILE = "models/RealESRGAN_x4plus_anime_6B.pth"
 STRUCT = np.ones((3, 3), dtype=bool)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# A pixel this dark counts as real ink. Everything within WALL_GROW of one is
+# walled off, closing the soft ramp the background otherwise leaks through into
+# a white subject. Kept below the ~200 that cream page stock sits at, so a
+# textured background never walls itself off.
+DARK_CORE = 180
+WALL_GROW = 2
+# Long side (px) the subject mask is computed at: WALL_GROW is a pixel count,
+# so it only means the same thing at a fixed scale.
+WORK_SCALE = 1200
+# Long side (px) at or above which a region is already detailed enough to skip
+# the 4x pass. The 4x exists to give a SMALL docling crop real pixels; on a
+# whole-page fallback (docling found no picture, so the region is the entire
+# 3000-4000px scan) it instead asks Real-ESRGAN for a ~15000px image -- thousands
+# of tiles and a multi-GB accumulator, which is what ran past the batch timeout.
+# make_4k still lifts the finished icon to 3840 afterwards.
+UPSCALE_BELOW = 1200
+
 
 _model = None
 
@@ -86,17 +104,58 @@ def upscale_rgb(pil_rgb: Image.Image, tile=256, overlap=32) -> Image.Image:
     return Image.fromarray((out * 255).round().astype(np.uint8))
 
 
-def foreground_from_flood(rgb_hd: Image.Image) -> np.ndarray:
-    arr = np.asarray(rgb_hd, dtype=np.int16)
-    light = arr.min(axis=2).astype(np.float32)
+# ---------- icon extraction ----------
+def _foreground_at_scale(rgb: Image.Image) -> np.ndarray:
+    """The actual background removal, always run at WORK_SCALE.
+
+    The flood already stops at any pixel darker than its tolerance, so the only
+    way background escapes into a WHITE subject -- a lab coat, litmus paper, a
+    karate gi -- is across the antialiased ramp beside an outline, where a few
+    intermediate pixels stay bright enough to step through. Walling off that
+    ramp (every pixel near a genuinely dark one) closes the leak.
+
+    Grading the wall by darkness rather than by gradient is what makes this
+    hold: a soft shadow fading into the page has no dark core, so it builds no
+    wall, and the flood clears it exactly as before.
+    """
+    arr = np.asarray(rgb, dtype=np.float32)
+    light = arr.min(axis=2)
     H, W = light.shape
+
+    wall = ndimage.binary_dilation(light < DARK_CORE, structure=STRUCT,
+                                   iterations=WALL_GROW)
+    walled = light.copy()
+    walled[wall] = 0.0
     bg = np.zeros((H, W), dtype=bool)
     seeds = [(0, 0), (0, W - 1), (H - 1, 0), (H - 1, W - 1),
              (0, W // 2), (H - 1, W // 2), (H // 2, 0), (H // 2, W - 1)]
     for y, x in seeds:
-        if light[y, x] > 185 and not bg[y, x]:
-            bg |= flood(light, (y, x), tolerance=55)
+        if walled[y, x] > 185 and not bg[y, x]:
+            bg |= flood(walled, (y, x), tolerance=55)
+    # reclaim the antialiased fringe the wall held back, but only where it is
+    # still background-bright, so the outline itself stays opaque.
+    bg = ndimage.binary_dilation(bg, structure=STRUCT, iterations=2) & (light > 170)
     return ~bg
+
+
+def foreground_from_flood(rgb_hd: Image.Image) -> np.ndarray:
+    """Subject mask for a crop, computed at WORK_SCALE and resized back.
+
+    WALL_GROW in `_foreground_at_scale` is a pixel count, so it only means the
+    same thing at a fixed scale -- on a 4x upscale the same ramp is 4x wider and
+    a 2px wall would no longer close it. Working small also keeps the flood off
+    a 25-megapixel array.
+    """
+    W0, H0 = rgb_hd.size
+    if max(W0, H0) <= WORK_SCALE:
+        return _foreground_at_scale(rgb_hd)
+    f = WORK_SCALE / max(W0, H0)
+    small = rgb_hd.resize((max(1, round(W0 * f)), max(1, round(H0 * f))),
+                          Image.LANCZOS)
+    mask = _foreground_at_scale(small)
+    up = Image.fromarray((mask * 255).astype(np.uint8), "L").resize(
+        (W0, H0), Image.BILINEAR)
+    return np.asarray(up) > 127
 
 
 def isolate(fg: np.ndarray):
@@ -109,12 +168,22 @@ def isolate(fg: np.ndarray):
     keep = [i for i in range(1, n + 1) if areas[i] >= 0.18 * areas.max()]
     if len(keep) > 14:
         return None
-    return np.isin(lbl, keep)
+    mask = np.isin(lbl, keep)
+    # Absorb pieces that a background leak severed from the kept body (the white
+    # sleeve case): adjacent to what we kept, and not a speck. Without this the
+    # 18%-of-largest rule silently deletes them.
+    near = ndimage.binary_dilation(mask, structure=STRUCT, iterations=6)
+    touching = np.unique(lbl[near])
+    extra = [i for i in touching
+             if i > 0 and i not in keep and areas[i] >= 0.002 * areas.max()]
+    if extra:
+        mask |= np.isin(lbl, extra)
+    return mask
 
 
-def extract_icons(doc, original: Image.Image, icons_dir: Path) -> int:
-    ow, oh = original.size
-    saved = 0
+def _picture_boxes(doc, ow: int, oh: int) -> list[tuple[int, int, int, int]]:
+    """Pixel boxes of the pictures docling found, in original-image coords."""
+    boxes = []
     for item, _ in doc.iterate_items():
         if not isinstance(item, PictureItem) or not item.prov:
             continue
@@ -125,30 +194,57 @@ def extract_icons(doc, original: Image.Image, icons_dir: Path) -> int:
         sx, sy = ow / pw, oh / ph
         l, t = max(0, int(bb.l * sx)), max(0, int(bb.t * sy))
         r, b = min(ow, int(bb.r * sx)), min(oh, int(bb.b * sy))
-        if r - l < 55 or b - t < 55:
-            continue
+        if r - l >= 55 and b - t >= 55:
+            boxes.append((l, t, r, b))
+    return boxes
 
-        hd = upscale_rgb(original.crop((l, t, r, b)))
-        W, H = hd.size
-        mask = isolate(foreground_from_flood(hd))
-        if mask is None:
-            continue
-        ys, xs = np.where(mask)
-        if ys.size == 0:
-            continue
-        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-        w, h = x1 - x0, y1 - y0
-        if max(w, h) < 120 or w / h > 4 or h / w > 4 or mask.sum() / (w * h) < 0.05:
-            continue
 
-        alpha = Image.fromarray((mask * 255).astype(np.uint8), "L").filter(
-            ImageFilter.GaussianBlur(0.6))
-        rgba = hd.copy()
-        rgba.putalpha(alpha)
-        pad = 8
-        box = (max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad))
-        saved += 1
-        rgba.crop(box).save(str(icons_dir / f"icon_{saved}.png"))  # 1-based
+def _save_icon(original: Image.Image, box, icons_dir: Path, index: int) -> bool:
+    """Upscale one region (only if it is small), isolate the subject, save it.
+    True if written."""
+    l, t, r, b = box
+    crop = original.crop((l, t, r, b))
+    hd = upscale_rgb(crop) if max(crop.size) < UPSCALE_BELOW else crop
+    W, H = hd.size
+    # Mask from the NATIVE crop, not the upscaled one: it is the sharpest copy
+    # of the outlines the flood walls depend on, and upscaling first only blurs
+    # them. The mask is then stretched onto the 4x image.
+    mask = isolate(foreground_from_flood(crop))
+    if mask is None:
+        return False
+    if mask.shape != (H, W):
+        mask = np.asarray(Image.fromarray((mask * 255).astype(np.uint8), "L")
+                          .resize((W, H), Image.BILINEAR)) > 127
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return False
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    w, h = x1 - x0, y1 - y0
+    if max(w, h) < 120 or w / h > 4 or h / w > 4 or mask.sum() / (w * h) < 0.05:
+        return False
+    alpha = Image.fromarray((mask * 255).astype(np.uint8), "L").filter(
+        ImageFilter.GaussianBlur(0.6))
+    rgba = hd.copy()
+    rgba.putalpha(alpha)
+    pad = 8
+    crop = (max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad))
+    rgba.crop(crop).save(str(icons_dir / f"icon_{index}.png"))
+    return True
+
+
+def extract_icons(doc, original: Image.Image, icons_dir: Path) -> int:
+    ow, oh = original.size
+    boxes = _picture_boxes(doc, ow, oh)
+    if not boxes:
+        # A full-bleed illustration with labels drawn over it reads as text-only
+        # to docling's layout model, so it reports no picture at all. Fall back
+        # to the whole page: background removal still isolates the subject.
+        print("[ICONS] docling found no picture region; using the whole image.")
+        boxes = [(0, 0, ow, oh)]
+    saved = 0
+    for box in boxes:
+        if _save_icon(original, box, icons_dir, saved + 1):   # 1-based
+            saved += 1
     return saved
 
 
@@ -332,18 +428,23 @@ def upload_to_drive(folder: Path, drive_name: str, parent: str | None):
 
 
 # ---------- reusable local processing ----------
-def process_local(img_path: Path, outbase: Path = Path("output"), res4k: bool = True):
+def process_local(img_path: Path, outbase: Path = Path("output"), res4k: bool = True,
+                  ratios: bool = True, ratio_mode: str = "stretch",
+                  ratio_bg: str = "white"):
     """Run the full local extraction for one image. Returns the output folder.
     Produces: icons/, icons_4k/ (optional), text.txt, <name>_dark.png,
-    <name>_numbered.png + numbered/ — all in one folder named after the image."""
+    <name>_numbered.png + numbered/, and 4K versions of the ORIGINAL image —
+    <name>_4k.png (its own aspect ratio, untouched) plus the reframed
+    <name>_2x3.png and <name>_1x1.png — all in one folder named after the image."""
     img_path = Path(img_path)
-    name = img_path.stem
+    name = safe_name(img_path)
     out = Path(outbase) / name
     icons_dir = out / "icons"
     icons_dir.mkdir(parents=True, exist_ok=True)
 
-    # clear stale icon outputs from a previous run (keeps names.txt)
-    for sub in ("icons", "icons_4k", "numbered"):
+    # clear stale icon outputs from a previous run (keeps names.txt, and keeps
+    # icons_4k so a run killed by a timeout resumes instead of starting over)
+    for sub in ("icons", "numbered"):
         d = out / sub
         if d.is_dir():
             for f in d.glob("*.png"):
@@ -368,16 +469,35 @@ def process_local(img_path: Path, outbase: Path = Path("output"), res4k: bool = 
     print(f"[TIME] docling {t_doc-t0:.0f}s | text {t_txt-t_doc:.0f}s | "
           f"icons {t_icons-t_txt:.0f}s")
 
+    if ratios:
+        # 4K versions of the ORIGINAL image (not the icons): its native ratio
+        # plus the reframed 2:3 and 1:1 crops. Done BEFORE the per-icon 4K loop:
+        # that loop can run for many minutes on CPU and a caller timeout used to
+        # kill the run before these ever got written.
+        from make_ratio import build_ratios
+        build_ratios(img_path, out, 3840, ratio_mode, ratio_bg, stem=name)
+
     if res4k:
         from make_4k import to_4k
         icons_4k = out / "icons_4k"
         icons_4k.mkdir(exist_ok=True)
         icon_files = sorted(icons_dir.glob("icon_*.png"),
                             key=lambda q: int(q.stem.split("_")[1]))
+        # extraction is deterministic, so a surviving icons_4k/x.png is still the
+        # 4K of this run's icons/x.png and can be reused; one with no matching
+        # icon is from an older, different run and must go.
+        names = {q.name for q in icon_files}
+        for q in icons_4k.glob("*.png"):
+            if q.name not in names:
+                q.unlink()
         total = len(icon_files)
         for i, p in enumerate(icon_files, 1):
+            dst = icons_4k / p.name
+            if dst.exists():              # resume after a timeout kill
+                print(f"[4K] {i}/{total} {p.name} (skip, exists)", flush=True)
+                continue
             ts = _t.time()
-            sz = to_4k(p, icons_4k / p.name, 3840)
+            sz = to_4k(p, dst, 3840)
             print(f"[4K] {i}/{total} {p.name} -> {sz[0]}x{sz[1]} "
                   f"({_t.time()-ts:.0f}s)", flush=True)
 
@@ -396,9 +516,21 @@ def main():
     ap.add_argument("--outdir", default="output", help="base output dir")
     ap.add_argument("--res4k", action="store_true",
                     help="also produce 4K (3840px) icons for smartboard display")
+    ap.add_argument("--no-ratios", action="store_true",
+                    help="skip the 4K versions of the original image "
+                         "(native ratio, 2:3 and 1:1)")
+    ap.add_argument("--ratio-mode", choices=("stretch", "fill", "fit"),
+                    default="stretch",
+                    help="stretch = whole image scaled to the exact size, nothing "
+                         "cropped or padded (default); fill = cover and crop; "
+                         "fit = pad instead")
+    ap.add_argument("--ratio-bg", default="white",
+                    help="padding colour for --ratio-mode fit, or 'none' for transparent")
     args = ap.parse_args()
 
-    out = process_local(Path(args.image), Path(args.outdir), res4k=args.res4k)
+    out = process_local(Path(args.image), Path(args.outdir), res4k=args.res4k,
+                        ratios=not args.no_ratios, ratio_mode=args.ratio_mode,
+                        ratio_bg=args.ratio_bg)
 
     if args.upload:
         link = upload_to_drive(out, out.name, args.parent)
