@@ -42,6 +42,9 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 TOKEN = "token_flow.json"
 SCRATCH = Path("_drive_scratch")
+# One entry per image handled in this run: (name, status, detail, seconds).
+# Drives the end-of-run summary / email.
+RESULTS = []
 IMAGE_MIMES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
 
 
@@ -275,17 +278,21 @@ def process_one(svc, img, input_id, archive_id, output_id, res4k, timeout,
         if err:
             print(f"[SKIP] {img['name']}: {err}. Left in input folder for retry. "
                   f"Elapsed {time.time() - t0:.1f}s")
+            RESULTS.append((img["name"], "SKIPPED", err, time.time() - t0))
             return False
         link = upload_folder(svc, out_folder, output_id)
         move_file(svc, img["id"], archive_id, input_id)
         print(f"[DONE] {img['name']} in {time.time() - t0:.1f}s "
               f"-> {link}; original archived.")
+        RESULTS.append((img["name"], "OK", link or "", time.time() - t0))
         return True
     except KeyboardInterrupt:
         raise
     except Exception as e:
         print(f"[FAIL] {img['name']}: {type(e).__name__}: {e}. Left in input "
               f"folder for retry. Elapsed {time.time() - t0:.1f}s")
+        RESULTS.append((img["name"], "FAILED", f"{type(e).__name__}: {e}",
+                        time.time() - t0))
         return False
     finally:
         if not keep_scratch:
@@ -360,6 +367,19 @@ def watch_events(svc, input_id, archive_id, output_id, res4k, timeout, interval,
         time.sleep(interval)
 
 
+def write_summary(path: Path):
+    """Machine-readable record of what this run did, for the notifier step.
+
+    One TAB-separated line per image: STATUS<TAB>name<TAB>seconds<TAB>detail
+    (detail = Drive link when OK, the error otherwise). Written even when
+    nothing was processed, so the notifier can tell "no work" from "crashed".
+    """
+    lines = [f"{st}\t{name}\t{secs:.0f}\t{detail}"
+             for name, st, detail, secs in RESULTS]
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+    print(f"[SUMMARY] {len(RESULTS)} image(s) -> {path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="input Drive folder (name or id)")
@@ -377,6 +397,9 @@ def main():
                          "(default: delete after a successful upload)")
     ap.add_argument("--file-id", default="",
                     help="process only this Drive file id, then exit (event/CI mode)")
+    ap.add_argument("--summary", default="",
+                    help="write a per-image result summary to this file (used by "
+                         "the CI email notifier)")
     args = ap.parse_args()
 
     svc = service()
@@ -386,23 +409,26 @@ def main():
 
     # Event/CI mode: a single file id was pushed (e.g. from Apps Script). Process
     # just that one file and exit — this is what a GitHub Actions run does.
-    if args.file_id:
-        meta = execute(svc.files().get(
-            fileId=args.file_id, fields="id,name,mimeType"))
-        if meta.get("mimeType") not in IMAGE_MIMES:
-            print(f"[SKIP] {meta.get('name')}: not an image ({meta.get('mimeType')}).")
-            return
-        process_one(svc, {"id": meta["id"], "name": meta["name"]},
-                    input_id, archive_id, output_id, args.res4k, args.timeout,
-                    args.keep_scratch)
-        return
-
-    if args.watch:
-        watch_events(svc, input_id, archive_id, output_id,
-                     args.res4k, args.timeout, args.interval, args.keep_scratch)
-    else:
-        run_once(svc, input_id, archive_id, output_id, args.res4k, args.timeout,
-                 args.keep_scratch)
+    try:
+        if args.file_id:
+            meta = execute(svc.files().get(
+                fileId=args.file_id, fields="id,name,mimeType"))
+            if meta.get("mimeType") not in IMAGE_MIMES:
+                print(f"[SKIP] {meta.get('name')}: not an image "
+                      f"({meta.get('mimeType')}).")
+                return
+            process_one(svc, {"id": meta["id"], "name": meta["name"]},
+                        input_id, archive_id, output_id, args.res4k, args.timeout,
+                        args.keep_scratch)
+        elif args.watch:
+            watch_events(svc, input_id, archive_id, output_id,
+                         args.res4k, args.timeout, args.interval, args.keep_scratch)
+        else:
+            run_once(svc, input_id, archive_id, output_id, args.res4k, args.timeout,
+                     args.keep_scratch)
+    finally:
+        if args.summary:
+            write_summary(Path(args.summary))
 
 
 if __name__ == "__main__":

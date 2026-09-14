@@ -79,4 +79,18 @@ jobs:
             --output "$OUTPUT_FOLDER" \
             --res4k \
             --timeout 3000 \
-            --file-id "$FILE_ID"
+            --file-id "$FILE_ID" \
+            --summary summary.txt
+
+      # Always runs, even when the step above crashed, so a hard failure still
+      # reaches your inbox. Does nothing if the mail secrets are not configured.
+      - name: Email the result
+        if: always()
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          NOTIFY_ON: always            # set to "problems" for failures-only mail
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: .venv/bin/python notify_email.py summary.txt
